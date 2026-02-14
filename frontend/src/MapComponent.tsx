@@ -53,20 +53,20 @@ const MapComponent = () => {
               maxLat: bounds.getNorth()
           };
       }
-      // Fallback relative to viewState (roughly 0.1 deg ~ 11km)
-      // At zoom 11, maybe cover 0.5 deg?
-      const delta = 0.3; // Approx 30km half-width
+      // Fallback relative to viewState based on zoom level
+      // Using a larger multiplier for safer coverage
+      const delta = 150 / Math.pow(2, viewState.zoom);
       return {
-          minLon: viewState.longitude - delta,
+          minLon: viewState.longitude - delta * 2,
           minLat: viewState.latitude - delta,
-          maxLon: viewState.longitude + delta,
+          maxLon: viewState.longitude + delta * 2,
           maxLat: viewState.latitude + delta
       };
   };
 
   const fetchStations = async () => {
       // Don't fetch if zoomed out too far
-      if (viewState.zoom < 9) {
+      if (viewState.zoom < 5) {
           console.log("Zoom too low, skipping fetch");
           return;
       }
@@ -102,7 +102,7 @@ const MapComponent = () => {
   useEffect(() => {
     const timer = setTimeout(() => {
         fetchStations();
-    }, 500); // 500ms debounce
+    }, 1000); // Increased debounce to 1000ms to handle large moves more gracefully
     return () => clearTimeout(timer);
   }, [viewState.latitude, viewState.longitude, viewState.zoom]);
 

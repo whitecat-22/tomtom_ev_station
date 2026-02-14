@@ -109,84 +109,147 @@ async def get_ev_stations(
     min_lat: float, min_lon: float, max_lat: float, max_lon: float
 ):
     """
-    Search for EV stations within a bounding box using grid search.
+    Search for EV stations within a bounding box using Asynchronous Batch Search API.
     """
     # Calculate dimensions
-    # Limit max size to prevent abuse (e.g. requesting whole world)
-    # Check simple degree diff
     lat_diff = abs(max_lat - min_lat)
     lon_diff = abs(max_lon - min_lon)
 
     if lat_diff > 5.0 or lon_diff > 5.0:
-        # Too large area, clamp or return error?
-        # For now, let's just proceed but maybe limit grid points internally
         logger.warning("Requested area is very large.")
 
     # Configuration for Grid Search
-    sub_radius_mt = 20000 # 20km radius search at each point
-    sub_radius_km = 20 # Step size roughly equals radius for good overlap
+    max_diff = max(lat_diff, lon_diff)
+    if max_diff < 0.1: step_km, sub_radius_mt = 3, 5000
+    elif max_diff < 0.5: step_km, sub_radius_mt = 10, 15000
+    elif max_diff < 2.0: step_km, sub_radius_mt = 25, 35000
+    else:
+        step_km = max(30, (max_diff * 111) / 8)
+        sub_radius_mt = 50000
 
-    search_points = generate_rect_grid(min_lat, min_lon, max_lat, max_lon, step_km=15)
 
-    logger.info(f"Generated {len(search_points)} search points for bounds ({min_lat},{min_lon})-({max_lat},{max_lon})")
+    search_points = generate_rect_grid(min_lat, min_lon, max_lat, max_lon, step_km=step_km)
 
-    # Limit maximum concurrent requests to avoid rate limits
-    # TomTom Free tier is often limited to few QPS. Reducing concurrency and adding delays.
-    MAX_CONCURRENT = 2
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    if not search_points:
+        return {"results": []}
 
-    async def fetch_point(p_lat, p_lon):
-        async with semaphore:
-            # Add delay to prevent hitting QPS limit instantly
-            await asyncio.sleep(0.5)
+    logger.info(f"Generated {len(search_points)} search points (step={step_km:.1f}km) for bounds ({min_lat},{min_lon})-({max_lat},{max_lon})")
 
-            path = f"/search/2/categorySearch/electric vehicle station.json"
-            params = {
-                "lat": p_lat,
-                "lon": p_lon,
-                "radius": sub_radius_mt,
-                "limit": 100,
-                "categorySet": "7309",
-                "relatedPois": "off",
-                "language": "NGT"
-            }
+    # Construct Batch Items
+    batch_items = []
 
-            # Retry logic for 429 Too Many Requests
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    data = await fetch_tomtom(path, params)
-                    return data.get("results", [])
-                except HTTPException as e:
-                    if e.status_code == 429:
-                        wait_time = (attempt + 1) * 1.5 # Backoff: 1.5s, 3s, 4.5s
-                        logger.warning(f"Rate limit 429 hit. Retrying in {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        # Other HTTP errors, don't retry
-                        # logger.error(f"HTTP Error fetching grid point: {e}")
-                        return []
-                except Exception as e:
-                    logger.error(f"Error fetching grid point: {e}")
-                    return []
+    import urllib.parse
+    # URL encode the category part of the path because it goes into a JSON body
+    # and won't be auto-encoded by the HTTP client
+    encoded_category = urllib.parse.quote("electric vehicle station")
+    # Batch API item query paths omit the service version (e.g. /search/2)
+    base_query_path = f"/categorySearch/{encoded_category}.json"
 
-            logger.error(f"Failed to fetch {p_lat},{p_lon} after {max_retries} retries")
-            return []
+    for p_lat, p_lon in search_points:
+        # Construct the query string for each item
+        # Note: Do not include API Key in individual items for Batch API, only in the batch request itself.
+        params = {
+            "lat": p_lat,
+            "lon": p_lon,
+            "radius": sub_radius_mt,
+            "limit": 100,
+            "categorySet": "7309",
+            "relatedPois": "off",
+            "language": "NGT"
+        }
+        # Encode params and append to path
+        query_string = urllib.parse.urlencode(params)
+        item = {"query": f"{base_query_path}?{query_string}"}
+        batch_items.append(item)
 
-    # Execute all requests
-    tasks = [fetch_point(p_lat, p_lon) for p_lat, p_lon in search_points]
-    all_results_lists = await asyncio.gather(*tasks)
+    # 1. Submit Batch Request
+    batch_url = "/search/2/batch.json"
+    batch_payload = {"batchItems": batch_items}
 
-    # Deduplicate results by ID
+    # We need to use client.post here. Since fetch_tomtom is designed for GET and has specific error handling,
+    # let's implement the batch flow directly here or add a helper for POST.
+    # For simplicity, using client directly here but with similar error handling context.
+
+    if client is None:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+
+    try:
+        # Submit batch
+        submit_response = await client.post(
+            batch_url,
+            json=batch_payload,
+            params={"key": TOMTOM_API_KEY},
+            timeout=30.0
+        )
+
+        # TomTom returns 303 See Other or 202 Accepted for asynchronous batch
+        if submit_response.status_code not in [200, 202, 303]:
+            submit_response.raise_for_status()
+
+        # 2. Get Status URL from Location Header
+        location_url = submit_response.headers.get("Location")
+        if not location_url:
+            # Fallback: sometimes it might be in the body or standard construction?
+            # As per docs, it should be in Location header.
+            logger.error("No Location header in batch submission response")
+            raise HTTPException(status_code=500, detail="Batch submission failed: No status URL")
+
+        # The Location URL is usually a full URL. httpx logic:
+        # If we use client.get(url), and url is absolute, it ignores base_url. This is what we want.
+
+        # 3. Poll for Completion
+        logger.info(f"Batch submitted. Polling location: {location_url}")
+
+        # We need to respect the Retry-After header if present, but for now simple polling.
+        start_time = asyncio.get_event_loop().time()
+        max_wait_time = 120 # Increased from 60 to 120 seconds
+
+        while True:
+            if asyncio.get_event_loop().time() - start_time > max_wait_time:
+                raise HTTPException(status_code=504, detail="Batch processing timed out")
+
+            # Check status
+            try:
+                status_response = await client.get(location_url, timeout=10.0)
+            except httpx.ReadTimeout:
+                logger.warning("Timeout while polling batch status. Retrying...")
+                await asyncio.sleep(1.0)
+                continue
+
+            if status_response.status_code == 200:
+                # Completed
+                batch_results = status_response.json()
+                break
+            elif status_response.status_code == 202:
+                # Still processing
+                await asyncio.sleep(2.0) # Increased polling interval for efficiency
+                continue
+            else:
+                # Error
+                status_response.raise_for_status()
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"TomTom Batch Error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"TomTom API Error: {e.response.text}")
+    except Exception as e:
+        import traceback
+        logger.error(f"Batch Request Error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 4. Process Results
     stations_map = {}
-    for results in all_results_lists:
-        for station in results:
-            if "id" in station:
-                stations_map[station["id"]] = station
+    if "batchItems" in batch_results:
+        for i, item in enumerate(batch_results["batchItems"]):
+            if item.get("statusCode") == 200 and "response" in item:
+                results = item["response"].get("results", [])
+                for station in results:
+                    if "id" in station:
+                        stations_map[station["id"]] = station
+            else:
+                logger.error(f"Batch item {i} failed: {item.get('statusCode')} - {item.get('response')}")
 
     unique_stations = list(stations_map.values())
-    logger.info(f"Total unique stations found: {len(unique_stations)}")
+    logger.info(f"Total unique stations found via Batch API: {len(unique_stations)}")
 
     return {"results": unique_stations}
 
